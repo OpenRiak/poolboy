@@ -3,10 +3,13 @@
 
 -ifdef(TEST).
 -ifdef(EQC).
+-compile(export_all).
 -include_lib("eqc/include/eqc.hrl").
 -include_lib("eqc/include/eqc_statem.hrl").
-
 -include_lib("eunit/include/eunit.hrl").
+
+-compile({nowarn_deprecated_function, 
+    [{gen_fsm, sync_send_all_state_event, 2}]}).
 
 poolboy_test_() ->
     {timeout, 20,

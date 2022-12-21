@@ -20,6 +20,9 @@
 -include_lib("pulse/include/pulse.hrl").
 -endif.
 
+-compile({nowarn_deprecated_function, 
+    [{gen_fsm, sync_send_all_state_event, 2}]}).
+
 -include_lib("eunit/include/eunit.hrl").
 
 -compile(export_all).
