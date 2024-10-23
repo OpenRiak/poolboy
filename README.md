@@ -1,6 +1,6 @@
 # Poolboy - A hunky Erlang worker pool factory
 
-[![Build Status](https://secure.travis-ci.org/basho/poolboy.png?branch=master)](http://travis-ci.org/basho/poolboy)
+![Poolboy OpenRiak Status](https://github.com/OpenRiak/poolboy/actions/workflows/erlang.yml/badge.svg?branch=openriak-3.2)
 
 ## Usage
 
