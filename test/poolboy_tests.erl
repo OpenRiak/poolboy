@@ -1,6 +1,7 @@
 -module(poolboy_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("stdlib/include/assert.hrl").
 
 -compile({nowarn_deprecated_function, 
             [{gen_fsm, sync_send_all_state_event, 2}]}).
@@ -21,6 +22,9 @@ pool_test_() ->
             error_logger:tty(true)
         end,
         [
+            {<<"Pool size adjustments">>,
+                fun pool_resize/0
+            },
             {<<"Basic pool operations">>,
                 fun pool_startup/0
             },
@@ -368,6 +372,106 @@ checkin_after_exception_in_transaction() ->
     end,
     ?assertEqual(2, length(?sync(Pool, get_avail_workers))),
     ok = ?sync(Pool, stop).
+
+pool_resize() ->
+    [ ok = pool_resize(SZ0, OF0, SZ1, OF1, Block)
+      || SZ0 <- lists:seq(1, 3),
+         OF0 <- lists:seq(0, 5),
+         SZ1 <- lists:seq(1, 5),
+         OF1 <- lists:seq(0, 3),
+         SZ0 < SZ1,
+         Block <- [false, true] ],
+    ok.
+
+pool_resize(Size0, Overflow0, Size1, Overflow1, Block) when Size1 > Size0 ->
+    io:format("\npool_resize ~b, ~b to ~b, ~b (Block: ~p)\n", [Size0, Overflow0, Size1, Overflow1, Block]),
+    {ok, Pool} = new_pool(Size0, Overflow0),
+    %% actual size, latched size, overflow:
+    ?assertEqual({Size0, Size0, Overflow0}, ?sync(Pool, get_pool_size)),
+
+    AllInitialWorkers = [poolboy:checkout(Pool, Block) || _ <- lists:seq(1, Size0 + Overflow0)],
+    ?assertEqual(full, poolboy:checkout(Pool, false)),
+    ?assertEqual({full, _WorkerQueue = 0, Overflow0, _Monitors = Size0 + Overflow0,
+                 Size0, _LatchedSize = Size0}, poolboy:status_ext(Pool)),
+
+    %% grow
+    ok = ?sync(Pool, {set_pool_size, Size1, Overflow1}),
+    %% actual size can be corrected ('pre-grown') towards latched size
+    %% taking into account current overflow, so we don't match on it
+    ?assertMatch({_, Size1, Overflow1}, ?sync(Pool, get_pool_size)),
+    io:format("after growing, pool size is ~p and state is ~p\n", [?sync(Pool, get_pool_size), poolboy:status_ext(Pool)]),
+
+    %% sup still has Size0 children but (Size1 - Size0) more checkouts should succeed
+    %% ?assertEqual({full, 0, Overflow0, Size0 + Overflow0, Size0, Size1}, poolboy:status_ext(Pool)):
+    %% no change until extra checkouts
+    ?assertEqual(Size0 + Overflow0, length(?sync(Pool, get_all_workers))),
+
+    case (Size1 + Overflow1) - (Size0 + Overflow0) of
+        Diff when Diff > 0 ->
+            MoreSeq = lists:seq(1, Diff),
+            io:format("going to check out ~b extra workers\n", [length(MoreSeq)]),
+            ExtraWorkers =
+                [ begin
+                      io:format("Checking out one, Status: ~p\n", [poolboy:status_ext(Pool)]),
+                      W = poolboy:checkout(Pool, Block),
+                      ?assert(is_pid(W)),
+                      %% it doesn't seem right that checkouts are possible
+                      %% even when status is 'full'; this is temporary and by
+                      %% design, until number of children after resize reaches
+                      %% latched size
+                      ?assertEqual(Size0 + Overflow0 + N, length(?sync(Pool, get_all_workers))),
+                      W
+                  end || N <- MoreSeq ],
+            %% now we are properly full
+            %% when we are full and *not undersize*, blocking checkout will timeout, so
+            ?assertEqual(full, poolboy:checkout(Pool, false)),
+            %% io:format("After growing, Status: ~p\n", [poolboy:status_ext(Pool)]),
+            ?assertEqual({full, 0, Overflow1, Size1 + Overflow1, Size1, Size1}, poolboy:status_ext(Pool)),
+
+            %% shrink
+            io:format("shrinking pool size back to ~b ~b\n", [Size0, Overflow0]),
+            ok = ?sync(Pool, {set_pool_size, Size0, Overflow0}),
+            ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
+            ?assertEqual(Size1 + Overflow1, length(?sync(Pool, get_all_workers))),  %% no change until checkins
+
+            %% checkouts are of course not possible
+            ?assertEqual(full, poolboy:checkout(Pool, false)),
+
+            %% checking in excess workers while full
+            io:format("now going to check in ~b extra workers\n", [length(ExtraWorkers)]),
+            _ = [ begin
+                      ok = poolboy:checkin(Pool, W),
+                      io:format(" Checked in one, Status: ~p\n", [poolboy:status_ext(Pool)])
+                      %% because we are over-overflow, worker is dismissed, not placed on queue
+                      %%?assertEqual(0, length(?sync(Pool, get_avail_workers))),
+                      %% -- except not always, again, depending on values of overflow vs max_overflow.
+                  end || W <- ExtraWorkers ];
+        _ ->
+            ok = ?sync(Pool, {set_pool_size, Size0, Overflow0}),
+            io:format("(already grown)\n", [])
+    end,
+
+    %% back to normal
+    %% checking in non-excess workers
+    {WorkersOverflowing, WorkersRestRemaining} = lists:split(Overflow0, AllInitialWorkers),
+    io:format("now going to check in ~b workers to trim in overflow\n", [length(WorkersOverflowing)]),
+    _ = [ begin
+              ok = poolboy:checkin(Pool, W),
+              io:format(" Checked in one, Status: ~p\n", [poolboy:status_ext(Pool)])
+          end || W <- WorkersOverflowing ],
+
+    [poolboy:checkin(Pool, W) || W <- WorkersRestRemaining],
+
+    %% make sure our arithmetics is correct (specifically, after all
+    %% checkins, exactly Size0 workers are on queue)
+    ?assertEqual({ready, Size0, 0, 0, Size0, Size0}, poolboy:status_ext(Pool)),
+    ok = ?sync(Pool, stop),
+
+    %% this to avoid an already_started condition on the next
+    %% new_pool, occasional seen on blinding fast machines such as
+    %% those running github CI
+    timer:sleep(10),
+    ok.
 
 pool_returns_status() ->
     {ok, Pool} = new_pool(2, 0),
