@@ -12,6 +12,7 @@
                 {gen_fsm, sync_send_all_state_event, 2}]}).
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
+         get_pool_size/1, set_pool_size/2,
          child_spec/2, child_spec/3, start/1, start/2, start_link/1,
          start_link/2, stop/1, status/1]).
 -export([init/1, ready/2, ready/3, overflow/2, overflow/3, full/2, full/3,
@@ -69,6 +70,14 @@ transaction(Pool, Fun) ->
     after
         ok = poolboy:checkin(Pool, Worker)
     end.
+
+-spec get_pool_size(pid()) -> {ok, non_neg_integer()} | {error, notfound}.
+get_pool_size(Pid) ->
+    gen_fsm:sync_send_all_state_event(Pid, get_pool_size).
+
+-spec set_pool_size(pid(), non_neg_integer()) -> ok | {error, notfound}.
+set_pool_size(Pid, NewSize) ->
+    gen_fsm:sync_send_all_state_event(Pid, {set_pool_size, NewSize}).
 
 -spec child_spec(Pool :: node(), PoolArgs :: proplists:proplist())
     -> supervisor:child_spec().
@@ -273,6 +282,10 @@ handle_sync_event(get_all_workers, _From, StateName, State) ->
 handle_sync_event(get_all_monitors, _From, StateName, State) ->
     Monitors = ets:tab2list(State#state.monitors),
     {reply, Monitors, StateName, State};
+handle_sync_event(get_pool_size, _From, StateName, State) ->
+    {reply, State#state.size, StateName, State};
+handle_sync_event({set_pool_size, NewSize}, _From, StateName, State) ->
+    {reply, ok, StateName, State#state{size = NewSize}};
 handle_sync_event(stop, _From, _StateName, State) ->
     Sup = State#state.supervisor,
     true = exit(Sup, shutdown),
