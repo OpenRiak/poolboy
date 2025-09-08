@@ -54,6 +54,9 @@ pool_test_() ->
             {<<"Worker checked-in after an exception in a transaction">>,
                 fun checkin_after_exception_in_transaction/0
             },
+            {<<"Pool size adjustments (no overflow)">>,
+                fun pool_resize_without_overflow/0
+            },
             {<<"Pool returns status">>,
                 fun pool_returns_status/0
             }
@@ -367,6 +370,48 @@ checkin_after_exception_in_transaction() ->
         throw:it_on_the_ground -> ok
     end,
     ?assertEqual(2, length(?sync(Pool, get_avail_workers))),
+    ok = ?sync(Pool, stop).
+
+pool_resize_without_overflow() ->
+    {ok, Pool} = new_pool(4, 0),
+    ?assertEqual({4, 0}, ?sync(Pool, get_pool_size)),
+
+    Workers0 = [poolboy:checkout(Pool) || _ <- lists:seq(1, 4)],
+    ?assertEqual(full, poolboy:checkout(Pool, false)),
+
+    ok = ?sync(Pool, {set_pool_size, 6}),
+    ?assertEqual({6, 0}, ?sync(Pool, get_pool_size)),
+    %% workers queue is still empty, but two more checkouts should succeed
+    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
+    ?assertEqual(4, length(?sync(Pool, get_all_workers))),
+
+    ExtraWorker0 = poolboy:checkout(Pool, false),
+    ?assert(is_pid(ExtraWorker0)),
+    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
+    ?assertEqual(5, length(?sync(Pool, get_all_workers))),  %% will be 6 after another checkout
+
+    ExtraWorker1 = poolboy:checkout(Pool, false),
+    ?assert(is_pid(ExtraWorker0)),
+    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
+    ?assertEqual(6, length(?sync(Pool, get_all_workers))),
+    ?assertEqual(full, poolboy:checkout(Pool, false)),
+
+    ok = ?sync(Pool, {set_pool_size, 4}),
+    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
+    ?assertEqual(6, length(?sync(Pool, get_all_workers))),  %% no change until checkins
+    ok = poolboy:checkin(Pool, ExtraWorker1),
+    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),  %% worker is dismissed, not placed on queue
+    ?assertEqual(5, length(?sync(Pool, get_all_workers))),
+    ok = poolboy:checkin(Pool, ExtraWorker0),
+    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),  %% worker is dismissed again
+    ?assertEqual(4, length(?sync(Pool, get_all_workers))),
+
+    [Worker2 | Workers2] = Workers0,
+    ok = poolboy:checkin(Pool, Worker2),
+    ?assertEqual(4, length(?sync(Pool, get_all_workers))),
+    ?assertEqual(1, length(?sync(Pool, get_avail_workers))),
+
+    [poolboy:checkin(Pool, W) || W <- Workers2],
     ok = ?sync(Pool, stop).
 
 pool_returns_status() ->

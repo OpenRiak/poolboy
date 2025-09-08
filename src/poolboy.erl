@@ -12,7 +12,7 @@
                 {gen_fsm, sync_send_all_state_event, 2}]}).
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
-         get_pool_size/1, set_pool_size/2,
+         get_pool_size/1, set_pool_size/2, set_pool_size/3,
          child_spec/2, child_spec/3, start/1, start/2, start_link/1,
          start_link/2, stop/1, status/1]).
 -export([init/1, ready/2, ready/3, overflow/2, overflow/3, full/2, full/3,
@@ -71,13 +71,16 @@ transaction(Pool, Fun) ->
         ok = poolboy:checkin(Pool, Worker)
     end.
 
--spec get_pool_size(pid()) -> {ok, non_neg_integer()} | {error, notfound}.
+-spec get_pool_size(pid()) -> {non_neg_integer(), non_neg_integer()}.
 get_pool_size(Pid) ->
     gen_fsm:sync_send_all_state_event(Pid, get_pool_size).
 
--spec set_pool_size(pid(), non_neg_integer()) -> ok | {error, notfound}.
+-spec set_pool_size(pid(), non_neg_integer()) -> ok.
 set_pool_size(Pid, NewSize) ->
     gen_fsm:sync_send_all_state_event(Pid, {set_pool_size, NewSize}).
+-spec set_pool_size(pid(), non_neg_integer(), non_neg_integer()) -> ok.
+set_pool_size(Pid, NewSize, NewMaxOverflow) ->
+    gen_fsm:sync_send_all_state_event(Pid, {set_pool_size, NewSize, NewMaxOverflow}).
 
 -spec child_spec(Pool :: node(), PoolArgs :: proplists:proplist())
     -> supervisor:child_spec().
@@ -148,12 +151,20 @@ init([], _WorkerArgs, #state{size=Size, supervisor=Sup, max_overflow=MaxOverflow
     {ok, StartState, State#state{workers=Workers}}.
 
 ready({checkin, Pid}, State) ->
+    #state{supervisor = Sup} = State,
     Monitors = State#state.monitors,
     case ets:lookup(Monitors, Pid) of
         [{Pid, Ref}] ->
             true = erlang:demonitor(Ref),
             true = ets:delete(Monitors, Pid),
-            Workers = queue:in(Pid, State#state.workers),
+            Workers =
+                case State#state.size < length(supervisor:which_children(Sup)) of
+                    true ->
+                        ok = dismiss_worker(Sup, Pid),
+                        State#state.workers;
+                    false ->
+                        queue:in(Pid, State#state.workers)
+                end,
             {next_state, ready, State#state{workers=Workers}};
         [] ->
             {next_state, ready, State}
@@ -163,28 +174,37 @@ ready(_Event, State) ->
 
 ready({checkout, Block, Timeout}, {FromPid, _}=From, State) ->
     #state{supervisor = Sup,
+           size = Size,
            workers = Workers,
            monitors = Monitors,
            max_overflow = MaxOverflow} = State,
-    case queue:out(Workers) of
-        {{value, Pid}, Left} ->
-            Ref = erlang:monitor(process, FromPid),
-            true = ets:insert(Monitors, {Pid, Ref}),
-            NextState = case queue:is_empty(Left) of
-                true when MaxOverflow < 1 -> full;
-                true -> overflow;
-                false -> ready
-            end,
-            {reply, Pid, NextState, State#state{workers=Left}};
-        {empty, Empty} when MaxOverflow > 0 ->
+    case Size > length(supervisor:which_children(Sup)) of
+        true ->
+            %% we are here after a set_pool_size with Size > OldSize:
             {Pid, Ref} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
-            {reply, Pid, overflow, State#state{workers=Empty, overflow=1}};
-        {empty, Empty} when Block =:= false ->
-            {reply, full, full, State#state{workers=Empty}};
-        {empty, Empty} ->
-            Waiting = add_waiting(From, Timeout, State#state.waiting),
-            {next_state, full, State#state{workers=Empty, waiting=Waiting}}
+            {reply, Pid, ready, State};
+        false ->
+            case queue:out(Workers) of
+                {{value, Pid}, Left} ->
+                    Ref = erlang:monitor(process, FromPid),
+                    true = ets:insert(Monitors, {Pid, Ref}),
+                    NextState = case queue:is_empty(Left) of
+                                    true when MaxOverflow < 1 -> full;
+                                    true -> overflow;
+                                    false -> ready
+                                end,
+                    {reply, Pid, NextState, State#state{workers=Left}};
+                {empty, Empty} when MaxOverflow > 0 ->
+                    {Pid, Ref} = new_worker(Sup, FromPid),
+                    true = ets:insert(Monitors, {Pid, Ref}),
+                    {reply, Pid, overflow, State#state{workers=Empty, overflow=1}};
+                {empty, Empty} when Block =:= false ->
+                    {reply, full, full, State#state{workers=Empty}};
+                {empty, Empty} ->
+                    Waiting = add_waiting(From, Timeout, State#state.waiting),
+                    {next_state, full, State#state{workers=Empty, waiting=Waiting}}
+            end
     end;
 ready(_Event, _From, State) ->
     {reply, ok, ready, State}.
@@ -259,8 +279,24 @@ full(_Event, State) ->
 full({checkout, true, Timeout}, From, State) ->
     Waiting = add_waiting(From, Timeout, State#state.waiting),
     {next_state, full, State#state{waiting=Waiting}};
-full({checkout, false, _Timeout}, _From, State) ->
-    {reply, full, full, State};
+full({checkout, false, _Timeout}, {FromPid, _}, State) ->
+    #state{size = Size,
+           monitors = Monitors,
+           supervisor = Sup} = State,
+    CurrentAllWorkersSize = length(supervisor:which_children(Sup)),
+    if Size > CurrentAllWorkersSize ->
+            {Pid, Ref} = new_worker(Sup, FromPid),
+            true = ets:insert(Monitors, {Pid, Ref}),
+            NextState =
+                if Size > CurrentAllWorkersSize + 1 ->
+                        ready;
+                   el/=se ->
+                        full
+                end,
+            {reply, Pid, NextState, State};
+       el/=se ->
+            {reply, full, full, State}
+    end;
 full(_Event, _From, State) ->
     {reply, ok, full, State}.
 
@@ -283,9 +319,12 @@ handle_sync_event(get_all_monitors, _From, StateName, State) ->
     Monitors = ets:tab2list(State#state.monitors),
     {reply, Monitors, StateName, State};
 handle_sync_event(get_pool_size, _From, StateName, State) ->
-    {reply, State#state.size, StateName, State};
+    {reply, {State#state.size, State#state.max_overflow}, StateName, State};
 handle_sync_event({set_pool_size, NewSize}, _From, StateName, State) ->
     {reply, ok, StateName, State#state{size = NewSize}};
+handle_sync_event({set_pool_size, NewSize, NewMaxOverflow}, _From, StateName, State) ->
+    {reply, ok, StateName, State#state{size = NewSize,
+                                       max_overflow = NewMaxOverflow}};
 handle_sync_event(stop, _From, _StateName, State) ->
     Sup = State#state.supervisor,
     true = exit(Sup, shutdown),
@@ -382,7 +421,9 @@ checkin_while_full(Pid, State) ->
            waiting = Waiting,
            monitors = Monitors,
            max_overflow = MaxOverflow,
-           overflow = Overflow} = State,
+           overflow = Overflow,
+           size = Size} = State,
+    EffectiveSize = length(supervisor:which_children(Sup)),
     case queue:out(Waiting) of
         {{value, {{FromPid, _}=From, Timeout, StartTime}}, Left} ->
             case wait_valid(StartTime, Timeout) of
@@ -395,13 +436,23 @@ checkin_while_full(Pid, State) ->
                     checkin_while_full(Pid, State#state{waiting=Left})
             end;
         {empty, Empty} when MaxOverflow < 1 ->
-            Workers = queue:in(Pid, State#state.workers),
-            {next_state, ready, State#state{workers=Workers,
-                                            waiting=Empty}};
+            if Size < EffectiveSize ->
+                    ok = dismiss_worker(Sup, Pid),
+                    NextState =
+                        if Size < EffectiveSize - 1 -> full;
+                           el/=se -> ready
+                        end,
+                    {next_state, NextState, State#state{waiting=Empty}};
+               el/=se ->
+                    Workers = queue:in(Pid, State#state.workers),
+                    {next_state, ready, State#state{workers=Workers,
+                                                    waiting=Empty}}
+            end;
         {empty, Empty} ->
             ok = dismiss_worker(Sup, Pid),
-            {next_state, overflow, State#state{waiting=Empty,
-                                               overflow=Overflow-1}}
+            {next_state, overflow,
+             State#state{waiting=Empty,
+                         overflow=Overflow-1}}
     end.
 
 handle_worker_exit(Pid, StateName, State) ->
