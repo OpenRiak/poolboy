@@ -14,7 +14,7 @@
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
          get_pool_size/1, set_pool_size/2, set_pool_size/3,
          child_spec/2, child_spec/3, start/1, start/2, start_link/1,
-         start_link/2, stop/1, status/1]).
+         start_link/2, stop/1, status/1, status_ext/1]).
 -export([init/1, ready/2, ready/3, overflow/2, overflow/3, full/2, full/3,
          handle_event/3, handle_sync_event/4, handle_info/3, terminate/3,
          code_change/4]).
@@ -40,6 +40,7 @@
     waiting :: poolboy_queue(),
     monitors :: ets:tid(),
     size = 5 :: non_neg_integer(),
+    latched_size = 5 :: non_neg_integer(),  %% as resized; size to converge eventually with that
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer()
 }).
@@ -71,7 +72,7 @@ transaction(Pool, Fun) ->
         ok = poolboy:checkin(Pool, Worker)
     end.
 
--spec get_pool_size(pid()) -> {non_neg_integer(), non_neg_integer()}.
+-spec get_pool_size(pid()) -> {non_neg_integer(), non_neg_integer(), non_neg_integer()}.
 get_pool_size(Pid) ->
     gen_fsm:sync_send_all_state_event(Pid, get_pool_size).
 
@@ -125,6 +126,10 @@ stop(Pool) ->
 -spec status(Pool :: node()) -> {atom(), integer(), integer(), integer()}.
 status(Pool) ->
     gen_fsm:sync_send_all_state_event(Pool, status).
+-spec status_ext(Pool :: node()) -> {atom(), integer(), integer(), integer(),
+                                     non_neg_integer(), non_neg_integer()}.
+status_ext(Pool) ->
+    gen_fsm:sync_send_all_state_event(Pool, status_ext).
 
 init({PoolArgs, WorkerArgs}) ->
     process_flag(trap_exit, true),
@@ -136,7 +141,7 @@ init([{worker_module, Mod} | Rest], WorkerArgs, State) when is_atom(Mod) ->
     {ok, Sup} = poolboy_sup:start_link(Mod, WorkerArgs),
     init(Rest, WorkerArgs, State#state{supervisor=Sup});
 init([{size, Size} | Rest], WorkerArgs, State) when is_integer(Size) ->
-    init(Rest, WorkerArgs, State#state{size=Size});
+    init(Rest, WorkerArgs, State#state{size=Size, latched_size=Size});
 init([{max_overflow, MaxOverflow} | Rest], WorkerArgs, State) when is_integer(MaxOverflow) ->
     init(Rest, WorkerArgs, State#state{max_overflow=MaxOverflow});
 init([_ | Rest], WorkerArgs, State) ->
@@ -151,14 +156,16 @@ init([], _WorkerArgs, #state{size=Size, supervisor=Sup, max_overflow=MaxOverflow
     {ok, StartState, State#state{workers=Workers}}.
 
 ready({checkin, Pid}, State) ->
-    #state{supervisor = Sup} = State,
-    Monitors = State#state.monitors,
+    #state{size = Size,
+           latched_size = LatchedSize,
+           supervisor = Sup,
+           monitors = Monitors} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, Ref}] ->
             true = erlang:demonitor(Ref),
             true = ets:delete(Monitors, Pid),
             Workers =
-                case State#state.size < length(supervisor:which_children(Sup)) of
+                case Size > LatchedSize of  %% when we shrunk
                     true ->
                         ok = dismiss_worker(Sup, Pid),
                         State#state.workers;
@@ -175,16 +182,16 @@ ready(_Event, State) ->
 ready({checkout, Block, Timeout}, {FromPid, _}=From, State) ->
     #state{supervisor = Sup,
            size = Size,
+           latched_size = LatchedSize,
            workers = Workers,
            monitors = Monitors,
            max_overflow = MaxOverflow} = State,
-    case Size > length(supervisor:which_children(Sup)) of
-        true ->
-            %% we are here after a set_pool_size with Size > OldSize:
+    if Size < LatchedSize ->  %% we grew
+            %% we are here after a set_pool_size with Size > OldSize
             {Pid, Ref} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
-            {reply, Pid, ready, State};
-        false ->
+            {reply, Pid, ready, State#state{size = Size + 1}};
+       el/=se ->
             case queue:out(Workers) of
                 {{value, Pid}, Left} ->
                     Ref = erlang:monitor(process, FromPid),
@@ -210,30 +217,50 @@ ready(_Event, _From, State) ->
     {reply, ok, ready, State}.
 
 overflow({checkin, Pid}, #state{overflow=0}=State) ->
-    Monitors = State#state.monitors,
+    #state{monitors = Monitors,
+           size = Size,
+           supervisor = Sup,
+           latched_size = LatchedSize} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, Ref}] ->
             true = erlang:demonitor(Ref),
             true = ets:delete(Monitors, Pid),
-            NextState = case State#state.size > 0 of
+            NextState = case Size > 0 of
                 true  -> ready;
                 false -> overflow
             end,
-            Workers = queue:in(Pid, State#state.workers),
-            {next_state, NextState, State#state{overflow=0, workers=Workers}};
+            Workers =
+                case Size > LatchedSize of
+                    true ->
+                        ok = dismiss_worker(Sup, Pid),
+                        State#state.workers;
+                    false ->
+                        queue:in(Pid, State#state.workers)
+                end,
+            {next_state, NextState, State#state{workers=Workers}};
         [] ->
             {next_state, overflow, State}
     end;
 overflow({checkin, Pid}, State) ->
-    #state{supervisor=Sup, monitors=Monitors, overflow=Overflow} = State,
+    #state{supervisor = Sup,
+           monitors = Monitors,
+           overflow = Overflow,
+           size = Size,
+           latched_size = LatchedSize} = State,
+    {NextState, NewOverflow} =
+        if Size > LatchedSize ->
+                {full, Overflow};
+           el/=se ->
+                {overflow, Overflow - 1}
+        end,
     case ets:lookup(Monitors, Pid) of
         [{Pid, Ref}] ->
             ok = dismiss_worker(Sup, Pid),
             true = erlang:demonitor(Ref),
             true = ets:delete(Monitors, Pid),
-            {next_state, overflow, State#state{overflow=Overflow-1}};
+            {next_state, NextState, State#state{overflow = NewOverflow}};
         [] ->
-            {next_state, overflow, State}
+            {next_state, NextState, State#state{overflow = NewOverflow}}
     end;
 overflow(_Event, State) ->
     {next_state, overflow, State}.
@@ -281,19 +308,19 @@ full({checkout, true, Timeout}, From, State) ->
     {next_state, full, State#state{waiting=Waiting}};
 full({checkout, false, _Timeout}, {FromPid, _}, State) ->
     #state{size = Size,
+           latched_size = LatchedSize,
            monitors = Monitors,
            supervisor = Sup} = State,
-    CurrentAllWorkersSize = length(supervisor:which_children(Sup)),
-    if Size > CurrentAllWorkersSize ->
+    if Size < LatchedSize ->
             {Pid, Ref} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
             NextState =
-                if Size > CurrentAllWorkersSize + 1 ->
+                if Size > LatchedSize + 1 ->
                         ready;
                    el/=se ->
                         full
                 end,
-            {reply, Pid, NextState, State};
+            {reply, Pid, NextState, State#state{size = Size + 1}};
        el/=se ->
             {reply, full, full, State}
     end;
@@ -307,6 +334,10 @@ handle_sync_event(status, _From, StateName, State) ->
     {reply, {StateName, queue:len(State#state.workers), State#state.overflow,
              ets:info(State#state.monitors, size)},
      StateName, State};
+handle_sync_event(status_ext, _From, StateName, State) ->
+    {reply, {StateName, queue:len(State#state.workers), State#state.overflow,
+             ets:info(State#state.monitors, size), State#state.size, State#state.latched_size},
+     StateName, State};
 handle_sync_event(get_avail_workers, _From, StateName, State) ->
     Workers = State#state.workers,
     WorkerList = queue:to_list(Workers),
@@ -319,11 +350,11 @@ handle_sync_event(get_all_monitors, _From, StateName, State) ->
     Monitors = ets:tab2list(State#state.monitors),
     {reply, Monitors, StateName, State};
 handle_sync_event(get_pool_size, _From, StateName, State) ->
-    {reply, {State#state.size, State#state.max_overflow}, StateName, State};
+    {reply, {State#state.size, State#state.latched_size, State#state.max_overflow}, StateName, State};
 handle_sync_event({set_pool_size, NewSize}, _From, StateName, State) ->
-    {reply, ok, StateName, State#state{size = NewSize}};
+    {reply, ok, StateName, State#state{latched_size = NewSize}};
 handle_sync_event({set_pool_size, NewSize, NewMaxOverflow}, _From, StateName, State) ->
-    {reply, ok, StateName, State#state{size = NewSize,
+    {reply, ok, StateName, State#state{latched_size = NewSize,
                                        max_overflow = NewMaxOverflow}};
 handle_sync_event(stop, _From, _StateName, State) ->
     Sup = State#state.supervisor,
@@ -422,8 +453,8 @@ checkin_while_full(Pid, State) ->
            monitors = Monitors,
            max_overflow = MaxOverflow,
            overflow = Overflow,
-           size = Size} = State,
-    EffectiveSize = length(supervisor:which_children(Sup)),
+           size = Size,
+           latched_size = LatchedSize} = State,
     case queue:out(Waiting) of
         {{value, {{FromPid, _}=From, Timeout, StartTime}}, Left} ->
             case wait_valid(StartTime, Timeout) of
@@ -436,23 +467,26 @@ checkin_while_full(Pid, State) ->
                     checkin_while_full(Pid, State#state{waiting=Left})
             end;
         {empty, Empty} when MaxOverflow < 1 ->
-            if Size < EffectiveSize ->
+            if Size > LatchedSize ->
                     ok = dismiss_worker(Sup, Pid),
-                    NextState =
-                        if Size < EffectiveSize - 1 -> full;
-                           el/=se -> ready
-                        end,
-                    {next_state, NextState, State#state{waiting=Empty}};
+                    {next_state, full, State#state{waiting = Empty,
+                                                   size = Size - 1}};
                el/=se ->
                     Workers = queue:in(Pid, State#state.workers),
                     {next_state, ready, State#state{workers=Workers,
                                                     waiting=Empty}}
             end;
         {empty, Empty} ->
+            {NextState, NewOverflow} =
+                if Size > LatchedSize ->
+                        {full, Overflow};
+                   el/=se ->
+                        {overflow, Overflow - 1}
+                end,
             ok = dismiss_worker(Sup, Pid),
-            {next_state, overflow,
-             State#state{waiting=Empty,
-                         overflow=Overflow-1}}
+            {next_state, NextState,
+             State#state{waiting = Empty,
+                         overflow = NewOverflow}}
     end.
 
 handle_worker_exit(Pid, StateName, State) ->
