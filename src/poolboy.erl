@@ -477,15 +477,16 @@ checkin_while_full(Pid, State) ->
                                                     waiting=Empty}}
             end;
         {empty, Empty} ->
-            {NextState, NewOverflow} =
+            {NextState, NewSize, NewOverflow} =
                 if Size > LatchedSize ->
-                        {full, Overflow};
+                        {full, Size - 1, Overflow};
                    el/=se ->
-                        {overflow, Overflow - 1}
+                        {overflow, Size, Overflow - 1}
                 end,
             ok = dismiss_worker(Sup, Pid),
             {next_state, NextState,
              State#state{waiting = Empty,
+                         size = NewSize,
                          overflow = NewOverflow}}
     end.
 

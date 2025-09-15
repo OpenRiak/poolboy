@@ -21,6 +21,9 @@ pool_test_() ->
             error_logger:tty(true)
         end,
         [
+            {<<"Pool size adjustments">>,
+                fun pool_resize/0
+            },
             {<<"Basic pool operations">>,
                 fun pool_startup/0
             },
@@ -53,12 +56,6 @@ pool_test_() ->
             },
             {<<"Worker checked-in after an exception in a transaction">>,
                 fun checkin_after_exception_in_transaction/0
-            },
-            {<<"Pool size adjustments (no overflow)">>,
-                fun pool_resize_without_overflow/0
-            },
-            {<<"Pool size adjustments (with overflow)">>,
-                fun pool_resize_with_overflow/0
             },
             {<<"Pool returns status">>,
                 fun pool_returns_status/0
@@ -375,117 +372,70 @@ checkin_after_exception_in_transaction() ->
     ?assertEqual(2, length(?sync(Pool, get_avail_workers))),
     ok = ?sync(Pool, stop).
 
-pool_resize_without_overflow() ->
-    {ok, Pool} = new_pool(4, 0),
-    ?assertEqual({4, 4, 0}, ?sync(Pool, get_pool_size)),
+pool_resize() ->
+    ok = pool_resize(4, 2, 6, 2, false),
+    ok = pool_resize(4, 2, 6, 0, false),
+    ok = pool_resize(4, 0, 6, 2, false),
+    ok.
 
-    Workers0 = [poolboy:checkout(Pool) || _ <- lists:seq(1, 4)],
-    ?assertEqual(full, poolboy:checkout(Pool, false)),
+pool_resize(Size0, Overflow0, Size1, Overflow1, Block) when Size1 > Size0 ->
+    io:format("pool_resize ~b, ~b to ~b, ~b\n", [Size0, Overflow0, Size1, Overflow1]),
+    {ok, Pool} = new_pool(Size0, Overflow0),
+    %% actual size, latched size, overflow:
+    ?assertEqual({Size0, Size0, Overflow0}, ?sync(Pool, get_pool_size)),
 
-    ok = ?sync(Pool, {set_pool_size, 6}),
-    ?assertEqual({4, 6, 0}, ?sync(Pool, get_pool_size)),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-    ?assertEqual(4, length(?sync(Pool, get_all_workers))),
-
-    %% workers queue is empty, but two more checkouts should succeed
-    ExtraWorker0 = poolboy:checkout(Pool, false),
-    ?assert(is_pid(ExtraWorker0)),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-    ?assertEqual(5, length(?sync(Pool, get_all_workers))),  %% will be 6 after another checkout
-
-    ExtraWorker1 = poolboy:checkout(Pool, false),
-    ?assert(is_pid(ExtraWorker0)),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-    ?assertEqual(6, length(?sync(Pool, get_all_workers))),
-    ?assertEqual({full, 0, 0, 6, 6, 6}, poolboy:status_ext(Pool)),
-    ?assertEqual(full, poolboy:checkout(Pool, false)),
-
-    ok = ?sync(Pool, {set_pool_size, 4}),
-    %% no change until checkins
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-    ?assertEqual(6, length(?sync(Pool, get_all_workers))),
-    ?assertEqual({full, 0, 0, 6, 6, 4}, poolboy:status_ext(Pool)),
-    ok = poolboy:checkin(Pool, ExtraWorker1),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),  %% worker is dismissed, not placed on queue
-    ?assertEqual(5, length(?sync(Pool, get_all_workers))),
-    ?assertEqual(full, poolboy:checkout(Pool, false)),
-
-    ok = poolboy:checkin(Pool, ExtraWorker0),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),  %% worker is dismissed again
-    ?assertEqual(4, length(?sync(Pool, get_all_workers))),
-
-    [Worker2 | Workers2] = Workers0,
-    ok = poolboy:checkin(Pool, Worker2),
-    ?assertEqual(4, length(?sync(Pool, get_all_workers))),
-    ?assertEqual(1, length(?sync(Pool, get_avail_workers))),
-
-    [poolboy:checkin(Pool, W) || W <- Workers2],
-    ok = ?sync(Pool, stop).
-
-pool_resize_with_overflow() ->
-    {ok, Pool} = new_pool(4, 2),
-    ?assertEqual({4, 4, 2}, ?sync(Pool, get_pool_size)),
-
-    Workers0 = [poolboy:checkout(Pool) || _ <- lists:seq(1, 6)],
-    ?assertEqual(full, poolboy:checkout(Pool, false)),
-    ?assertEqual({full, 0, 2, 6}, poolboy:status(Pool)),
+    [Worker0 | WorkersRest] = [poolboy:checkout(Pool, Block) || _ <- lists:seq(1, Size0 + Overflow0)],
+    ?assertEqual(full, poolboy:checkout(Pool, Block)),
+    ?assertEqual({full, _WorkerQueue = 0, Overflow0, _Monitors = Size0 + Overflow0,
+                 Size0, _LatchedSize = Size0}, poolboy:status_ext(Pool)),
 
     %% grow
-    ok = ?sync(Pool, {set_pool_size, 6, 2}),
-    ?assertEqual({4, 6, 2}, ?sync(Pool, get_pool_size)),
-    %% sup still has 6 children but two more checkouts should succeed
-    ?assertEqual({full, 0, 2, 6}, poolboy:status(Pool)),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-    ?assertEqual(6, length(?sync(Pool, get_all_workers))),
+    ok = ?sync(Pool, {set_pool_size, Size1, Overflow1}),
+    ?assertEqual({Size0, Size1, Overflow1}, ?sync(Pool, get_pool_size)),
+    %% sup still has Size0 children but (Size1 - Size0) more checkouts should succeed
+    ?assertEqual({full, 0, Overflow0, Size0 + Overflow0, Size0, Size1}, poolboy:status_ext(Pool)),
+    ?assertEqual(Size0 + Overflow0, length(?sync(Pool, get_all_workers))),  %% no change until extra checkouts
 
-    ExtraWorker0 = poolboy:checkout(Pool, false),
-    ?assert(is_pid(ExtraWorker0)),
-    %% it doesn't seem right that checkouts are possible even when status is 'full';
-    %% this is temporary, until number of children after resize reaches target size
-    ?assertEqual({full, 0, 2, 7}, poolboy:status(Pool)),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-    ?assertEqual(7, length(?sync(Pool, get_all_workers))),  %% now 7, can take 1 more
+    MoreSeq = lists:seq(1, (Size1 + Overflow1) - (Size0 + Overflow0)),
+    io:format("growing by ~b\n", [length(MoreSeq)]),
+    ExtraWorkers =
+        [ begin
+              W = poolboy:checkout(Pool, false),
+              ?assert(is_pid(W)),
+              %% it doesn't seem right that checkouts are possible even when status is 'full';
+              %% this is temporary, until number of children after resize reaches latched size
+              ?assertEqual({full, 0, Overflow1, Size0 + Overflow0 + N, Size0 + N, Size1},
+                           poolboy:status_ext(Pool)),
+              ?assertEqual(Size0 + Overflow0 + N, length(?sync(Pool, get_all_workers))),
+              W
+          end || N <- MoreSeq ],
 
-    ExtraWorker1 = poolboy:checkout(Pool, false),
-    ?assert(is_pid(ExtraWorker0)),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-    ?assertEqual(8, length(?sync(Pool, get_all_workers))),
-    %% now size == number of children; can't checkout, back to normal
+    io:format("Status: ~p\n", [poolboy:status_ext(Pool)]),
     ?assertEqual(full, poolboy:checkout(Pool, false)),
 
     %% shrink
-    ok = ?sync(Pool, {set_pool_size, 4}),  %% max_overflow remains 2
+    ok = ?sync(Pool, {set_pool_size, Size0, 0}),
     ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-    ?assertEqual(8, length(?sync(Pool, get_all_workers))),  %% no change until checkins
-    ok = poolboy:checkin(Pool, ExtraWorker1),
-    %% because we are over-overflow, worker is dismissed, not placed on queue
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-    ?assertEqual(7, length(?sync(Pool, get_all_workers))),
-    %% still full, overflow won't change until we're back to normal
-    ?assertEqual({full, 0, 2, 7}, poolboy:status(Pool)),
+    ?assertEqual(Size1 + Overflow1, length(?sync(Pool, get_all_workers))),  %% no change until checkins
 
-    ok = poolboy:checkin(Pool, ExtraWorker0),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),  %% worker is dismissed again
-    ?assertEqual(6, length(?sync(Pool, get_all_workers))),
-    ?assertEqual({full, 0, 2, 6}, poolboy:status(Pool)),  %% still full, not overflow
+    %% shrinking while full
+    _ = [ begin
+              ok = poolboy:checkin(Pool, W),
+              %% because we are over-overflow, worker is dismissed, not placed on queue
+              ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
+              ?assertEqual(Size1 + Overflow1 - N, length(?sync(Pool, get_all_workers))),
+              %% still full, overflow won't change until we're back to normal
+              ?assertEqual({full, 0, Overflow1, Size1 + Overflow1 - N, Size1 - N, Size0},
+                           poolboy:status_ext(Pool))
+          end || {N, W} <- lists:zip(MoreSeq, ExtraWorkers) ],
+
     %% back to normal
 
-    [Worker2 | Workers2] = Workers0,
-    ok = poolboy:checkin(Pool, Worker2),
-    ?assertEqual(5, length(?sync(Pool, get_all_workers))),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
+    ok = poolboy:checkin(Pool, Worker0),
+    ?assertEqual(1, length(?sync(Pool, get_avail_workers))),
+    ?assertEqual(Size1, length(?sync(Pool, get_all_workers))),
 
-    [Worker3 | Workers3] = Workers2,
-    ok = poolboy:checkin(Pool, Worker3),
-    ?assertEqual(4, length(?sync(Pool, get_all_workers))),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-
-    [Worker4 | Workers4] = Workers3,
-    ok = poolboy:checkin(Pool, Worker4),
-    ?assertEqual(0, length(?sync(Pool, get_avail_workers))),
-    ?assertEqual(3, length(?sync(Pool, get_all_workers))),
-
-    [poolboy:checkin(Pool, W) || W <- Workers4],
+    [poolboy:checkin(Pool, W) || W <- WorkersRest],
     ok = ?sync(Pool, stop).
 
 pool_returns_status() ->
