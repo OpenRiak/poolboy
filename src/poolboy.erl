@@ -164,15 +164,16 @@ ready({checkin, Pid}, State) ->
         [{Pid, Ref}] ->
             true = erlang:demonitor(Ref),
             true = ets:delete(Monitors, Pid),
-            Workers =
+            {NewSize, Workers} =
                 case Size > LatchedSize of  %% when we shrunk
                     true ->
                         ok = dismiss_worker(Sup, Pid),
-                        State#state.workers;
+                        {Size - 1, State#state.workers};
                     false ->
-                        queue:in(Pid, State#state.workers)
+                        {Size, queue:in(Pid, State#state.workers)}
                 end,
-            {next_state, ready, State#state{workers=Workers}};
+            {next_state, ready, State#state{workers = Workers,
+                                            size = NewSize}};
         [] ->
             {next_state, ready, State}
     end;
@@ -354,8 +355,21 @@ handle_sync_event(get_pool_size, _From, StateName, State) ->
 handle_sync_event({set_pool_size, NewSize}, _From, StateName, State) ->
     {reply, ok, StateName, State#state{latched_size = NewSize}};
 handle_sync_event({set_pool_size, NewSize, NewMaxOverflow}, _From, StateName, State) ->
+    %% minimize overflow
+    SizeDiff = NewSize - State#state.size,
+    MegaDiff = NewSize - (State#state.size + State#state.overflow),
+    {SizeCorrected, OverflowCorrected} =
+        if MegaDiff > 0 ->
+                {State#state.size + State#state.overflow, 0};  %% with some slack
+           SizeDiff > 0 ->
+                {State#state.size + SizeDiff, State#state.overflow - SizeDiff};
+           el/=se ->
+                {State#state.size, State#state.overflow}
+        end,
     {reply, ok, StateName, State#state{latched_size = NewSize,
-                                       max_overflow = NewMaxOverflow}};
+                                       max_overflow = NewMaxOverflow,
+                                       size = SizeCorrected,
+                                       overflow = OverflowCorrected}};
 handle_sync_event(stop, _From, _StateName, State) ->
     Sup = State#state.supervisor,
     true = exit(Sup, shutdown),
