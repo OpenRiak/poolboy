@@ -468,6 +468,7 @@ checkin_while_full(Pid, State) ->
     #state{supervisor = Sup,
            waiting = Waiting,
            monitors = Monitors,
+           workers = Workers,
            max_overflow = MaxOverflow,
            overflow = Overflow,
            size = Size,
@@ -489,22 +490,24 @@ checkin_while_full(Pid, State) ->
                     {next_state, full, State#state{waiting = Empty,
                                                    size = Size - 1}};
                el/=se ->
-                    Workers = queue:in(Pid, State#state.workers),
-                    {next_state, ready, State#state{workers=Workers,
-                                                    waiting=Empty}}
+                    {next_state, ready, State#state{workers = queue:in(Pid, Workers),
+                                                    waiting = Empty}}
             end;
         {empty, Empty} ->
-            {NextState, NewSize, NewOverflow} =
+            {NextState, NewSize, NewOverflow, NewWorkers} =
                 if Size > LatchedSize ->
-                        {full, Size - 1, Overflow};
+                        ok = dismiss_worker(Sup, Pid),
+                        {full, Size - 1, Overflow, Workers};
+                   Overflow > 1 ->
+                        ok = dismiss_worker(Sup, Pid),
+                        {overflow, Size, Overflow - 1, Workers};
                    el/=se ->
-                        {overflow, Size, Overflow - 1}
+                        {ready, Size, 0, queue:in(Pid, Workers)}
                 end,
-            ok = dismiss_worker(Sup, Pid),
-            {next_state, NextState,
-             State#state{waiting = Empty,
-                         size = NewSize,
-                         overflow = NewOverflow}}
+            {next_state, NextState, State#state{waiting = Empty,
+                                                workers = NewWorkers,
+                                                size = NewSize,
+                                                overflow = NewOverflow}}
     end.
 
 handle_worker_exit(Pid, StateName, State) ->
