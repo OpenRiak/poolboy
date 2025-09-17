@@ -310,18 +310,21 @@ full({checkout, true, Timeout}, From, State) ->
 full({checkout, false, _Timeout}, {FromPid, _}, State) ->
     #state{size = Size,
            latched_size = LatchedSize,
+           max_overflow = MaxOverflow,
+           overflow = Overflow,
            monitors = Monitors,
            supervisor = Sup} = State,
-    if Size < LatchedSize ->
+    if Size + Overflow < LatchedSize + MaxOverflow ->
             {Pid, Ref} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
-            NextState =
-                if Size > LatchedSize + 1 ->
-                        ready;
+            {NextState, NewOverflow, NewSize} =
+                if Size < LatchedSize ->
+                        {full, Overflow, Size + 1};
                    el/=se ->
-                        full
+                        {overflow, Overflow + 1, Size}
                 end,
-            {reply, Pid, NextState, State#state{size = Size + 1}};
+            {reply, Pid, NextState, State#state{size = NewSize,
+                                                overflow = NewOverflow}};
        el/=se ->
             {reply, full, full, State}
     end;
