@@ -356,7 +356,7 @@ handle_sync_event(get_all_monitors, _From, StateName, State) ->
 handle_sync_event(get_pool_size, _From, StateName, State) ->
     {reply, {State#state.size, State#state.latched_size, State#state.max_overflow}, StateName, State};
 handle_sync_event({set_pool_size, NewSize}, _From, StateName, State) ->
-    {reply, ok, StateName, State#state{latched_size = NewSize}};
+    handle_sync_event({set_pool_size, NewSize, State#state.max_overflow}, _From, StateName, State);
 handle_sync_event({set_pool_size, NewSize, NewMaxOverflow}, _From, StateName, State) ->
     %% minimize overflow
     SizeDiff = NewSize - State#state.size,
