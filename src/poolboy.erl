@@ -157,6 +157,8 @@ init([], _WorkerArgs, #state{size=Size, supervisor=Sup, max_overflow=MaxOverflow
 
 ready({checkin, Pid}, State) ->
     #state{size = Size,
+           overflow = Overflow,
+           max_overflow = MaxOverflow,
            latched_size = LatchedSize,
            supervisor = Sup,
            monitors = Monitors} = State,
@@ -164,16 +166,20 @@ ready({checkin, Pid}, State) ->
         [{Pid, Ref}] ->
             true = erlang:demonitor(Ref),
             true = ets:delete(Monitors, Pid),
-            {NewSize, Workers} =
-                case Size > LatchedSize of  %% when we shrunk
+            {NewSize, NewOverflow, Workers} =
+                case Size + Overflow > LatchedSize + MaxOverflow of  %% when we shrunk
+                    true when Size > LatchedSize ->
+                        ok = dismiss_worker(Sup, Pid),
+                        {Size - 1, Overflow, State#state.workers};
                     true ->
                         ok = dismiss_worker(Sup, Pid),
-                        {Size - 1, State#state.workers};
+                        {Size, Overflow - 1, State#state.workers};
                     false ->
-                        {Size, queue:in(Pid, State#state.workers)}
+                        {Size, Overflow, queue:in(Pid, State#state.workers)}
                 end,
             {next_state, ready, State#state{workers = Workers,
-                                            size = NewSize}};
+                                            size = NewSize,
+                                            overflow = NewOverflow}};
         [] ->
             {next_state, ready, State}
     end;
@@ -304,10 +310,7 @@ full({checkin, Pid}, State) ->
 full(_Event, State) ->
     {next_state, full, State}.
 
-full({checkout, true, Timeout}, From, State) ->
-    Waiting = add_waiting(From, Timeout, State#state.waiting),
-    {next_state, full, State#state{waiting=Waiting}};
-full({checkout, false, _Timeout}, {FromPid, _}, State) ->
+full({checkout, Block, Timeout}, {FromPid, _} = From, State) ->
     #state{size = Size,
            latched_size = LatchedSize,
            max_overflow = MaxOverflow,
@@ -325,6 +328,9 @@ full({checkout, false, _Timeout}, {FromPid, _}, State) ->
                 end,
             {reply, Pid, NextState, State#state{size = NewSize,
                                                 overflow = NewOverflow}};
+       Block == true ->
+            Waiting = add_waiting(From, Timeout, State#state.waiting),
+            {next_state, full, State#state{waiting=Waiting}};
        el/=se ->
             {reply, full, full, State}
     end;
@@ -498,7 +504,7 @@ checkin_while_full(Pid, State) ->
                 if Size > LatchedSize ->
                         ok = dismiss_worker(Sup, Pid),
                         {full, Size - 1, Overflow, Workers};
-                   Overflow > 1 ->
+                   Overflow > 0 ->
                         ok = dismiss_worker(Sup, Pid),
                         {overflow, Size, Overflow - 1, Workers};
                    el/=se ->
