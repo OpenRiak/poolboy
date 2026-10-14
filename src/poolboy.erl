@@ -3,13 +3,17 @@
 -module(poolboy).
 -behaviour(gen_fsm).
 
--compile({nowarn_deprecated_function, 
-            [{gen_fsm, start_link, 3},
-                {gen_fsm, start, 3},
-                {gen_fsm, reply, 2},
-                {gen_fsm, sync_send_event, 3},
-                {gen_fsm, send_event, 2},
-                {gen_fsm, sync_send_all_state_event, 2}]}).
+-compile([{nowarn_deprecated_function,
+           [{gen_fsm, start_link, 3},
+            {gen_fsm, start, 3},
+            {gen_fsm, sync_send_event, 3},
+            {gen_fsm, send_event, 2},
+            {gen_fsm, sync_send_all_state_event, 2},
+            {gen_fsm, reply, 2}
+           ]
+          },
+          nowarn_deprecated_callback
+         ]).
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
          child_spec/2, child_spec/3, start/1, start/2, start_link/1,
