@@ -6,7 +6,7 @@ REBAR ?= ../riak/rebar3
 DIALYZER_WARNINGS = -Wunmatched_returns -Werror_handling \
                     -Wrace_conditions -Wunderspecs
 
-.PHONY: all compile test clean get-deps build-plt dialyze
+.PHONY: all compile test qc clean dialyze
 
 all: compile
 
@@ -21,9 +21,6 @@ qc: compile
 
 clean:
 	@$(REBAR) clean
-
-get-deps:
-	@$(REBAR) get-deps
 
 dialyze: compile
 	@$(REBAR) dialyzer
